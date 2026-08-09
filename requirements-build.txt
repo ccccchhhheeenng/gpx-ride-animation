@@ -1,0 +1,8 @@
+pyinstaller>=6.10,<7
+gpxpy>=1.6,<2
+numpy>=1.26,<3
+contextily>=1.6,<2
+Pillow>=10,<13
+matplotlib>=3.8,<4
+opencv-python>=4.9,<5
+imageio-ffmpeg>=0.5,<1

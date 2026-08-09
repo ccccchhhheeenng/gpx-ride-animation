@@ -1,7 +1,0 @@
-gpxpy>=1.6
-numpy>=1.24
-matplotlib>=3.9
-geopy>=2.4
-contextily>=1.6
-moviepy>=2.0
-pillow>=10.0

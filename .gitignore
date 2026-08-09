@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv_*/
+venv/
+
+# PyInstaller working output
+build/
+dist/
+release/
+_build_assets/
+*.exe
+*.zip
+ffmpeg.exe
+
+# Local ride inputs and rendered videos
+*.gpx
+*.mp4
+
+# Editors and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

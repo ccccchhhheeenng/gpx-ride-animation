@@ -1,76 +1,69 @@
-# GPX 騎乘動態回放產生器
+# GPX Ride Renderer
 
-把 GPX 騎行紀錄轉成類似 Strava / Relive 的動態回放影片：地圖鏡頭跟隨、依速度上色的漸層軌跡、即時 HUD、結尾鏡頭拉遠看全程路線並疊上數據卡。
+這是 [shao0927/gpx-ride-animation](https://github.com/shao0927/gpx-ride-animation) 的 Windows 強化版，可將 GPX 騎乘紀錄轉成動態地圖影片。此版本加入圖形介面、多程序渲染、Workers Auto Tune、NVIDIA NVENC、結尾路線總覽與 RIDE STATS，並提供可攜式 Windows EXE。
 
-![核心邏輯](gpx_animation_core_code.png)
+## 功能
 
-## 效果
+- Windows 圖形介面，可直接選擇 GPX、輸出位置、解析度與地圖風格
+- 依 GPX 距離自動計算影片長度
+- 多程序動態分塊渲染，支援 Workers Auto Tune
+- NVIDIA NVENC 硬體編碼，無法使用時回退至 libx264
+- 局部高解析度底圖、即時軌跡、速度 HUD、小地圖與海拔圖
+- 結尾 zoom-out、完整路線總覽與騎乘統計
+- Windows 可攜式 ZIP，不必另外安裝 FFmpeg
 
-- 真實地圖底圖（執行時互動選單：深色 / 全彩 / 淺灰白 / 衛星四選一）
-- 軌跡依速度漸層上色（快 = 紅、慢 = 藍紫）
-- 鏡頭平滑跟隨騎士位置，不會跳幀
-- 右上角小地圖：全程路線 + 目前進度
-- 底部海拔剖面圖
-- 結尾鏡頭平滑拉遠，框住全程路線，疊加總距離 / 總爬升 / 均速 / 總時長
+## 畫面預覽
 
-## 安裝
+渲染設定與多 worker 進度：
 
-```bash
-pip install -r requirements.txt
+![GPX Ride Renderer 渲染介面](https://hackmd.io/_uploads/Byo_aXrUze.png)
+
+V1.0.0 完成畫面與 overview 底圖：
+
+![GPX Ride Renderer 完成畫面](https://hackmd.io/_uploads/BkFSR4BUGg.png)
+
+## 專案內容
+
+```text
+GPX_Ride_Renderer.py                 最新主程式
+GPX_Ride_Renderer.spec               PyInstaller 設定
+build_exe.bat                        Windows 打包腳本
+requirements-build.txt               執行與打包相依套件
+run_source.bat                       從原始碼啟動
 ```
 
-需要能連網（下載地圖底圖用）。
+儲存庫只保留原始碼與建置腳本，不包含編譯產物。若只想使用程式，請前往 [GitHub Releases](https://github.com/ccccchhhheeenng/gpx-ride-animation/releases/latest) 下載 `GPX_Ride_Renderer_Windows_x64.zip`，解壓縮後執行 `GPX Ride Renderer.exe`。
 
-## 使用方式
+## 從原始碼執行
 
-1. 把你的 `.gpx` 檔案放到同一個資料夹
-2. 打開 `gpx_strava_style_animation.py`，把 `gpx_filename` 改成你的檔名
-3. 執行：
+需要 64 位元 Python 3.10 或更新版本。
 
-```bash
-python gpx_strava_style_animation.py
+```bat
+run_source.bat
 ```
 
-執行後會跳出互動選單，現場選擇地圖底圖風格：
+若尚未安裝相依套件：
 
-```
-請選擇地圖底圖風格：
-  1. CartoDB.DarkMatter（深色，彩色軌跡對比最強）
-  2. CartoDB.Voyager（全彩，最接近 Relive / Google Maps）
-  3. CartoDB.Positron（淺灰白，極簡）
-  4. Esri.WorldImagery（真實衛星空拍圖）
-輸入編號 (直接按 Enter 預設 1):
+```powershell
+python -m pip install -r requirements-build.txt
 ```
 
-不確定選哪個？先跑：
+## 重新打包
 
-```bash
-python preview_map_styles.py
+```bat
+build_exe.bat
 ```
 
-會產生 `map_style_comparison.png`，四種底圖同一畫面並排比較，看完再回去改 `MAP_STYLE`。
+完成後，新版 ZIP 位於：
 
-## 可調整的參數
+```text
+release\GPX_Ride_Renderer_Windows_x64.zip
+```
 
-都在 `gpx_strava_style_animation.py` 開頭的 CONFIG 區塊：
+ZIP 不需複製到專案根目錄，也不要提交到 Git。建立新版時，將它上傳為 GitHub Release 的附件。
 
-| 參數 | 說明 |
-|---|---|
-| `VIEW_MARGIN` | 主鏡頭視角半徑（公尺），數字越小放大越多 |
-| `CAMERA_SMOOTH` | 鏡頭平滑係數 (0~1)，越小越黏、越大反應越快但易抖動 |
-| `VIDEO_DURATION` | 動畫主體秒數，數字越大播放越慢 |
-| `ZOOM_OUT_DURATION` | 結尾鏡頭拉遠所花的秒數 |
-| `END_HOLD_DURATION` | 結尾定格 + 數據卡停留秒數 |
-| `FPS` | 每秒幀數，越高越滑順但渲染越久 |
-| `TRACK_CMAP` | 軌跡漸層配色（plasma / turbo / viridis / coolwarm...） |
+目前公開版本為 V1.0.0。先前的 V7.5.x 名稱屬於尚未公開的開發階段；公開版本從 V1.0.0 開始。
 
-## 已知限制
+## 上游與授權
 
-- 地圖底圖下載需要網路連線，若失敗會自動跳過底圖（軌跡仍會正常畫出）
-- 動畫進度是依「軌跡點序號」對應時間，若 GPX 取樣間隔很不均勻（長時間停等），畫面移動速度可能忽快忽慢
-- 已針對 moviepy 2.x（`moviepy.editor` 已移除）與 matplotlib 3.11 即將移除的 `cm.get_cmap` 做相容性修正
-
-## 環境
-
-- Python 3.10+
-- 見 `requirements.txt`
+本 fork 已取得原作者同意建立。上游儲存庫目前沒有 `LICENSE`，此同意不等同於標準開源授權；原始程式的權利仍屬原作者所有。
