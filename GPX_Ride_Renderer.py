@@ -60,6 +60,8 @@ import subprocess
 import time
 import tempfile
 import multiprocessing as mp
+import copy
+from io import BytesIO
 
 
 def _force_utf8_stdio():
@@ -121,6 +123,8 @@ from pathlib import Path
 import gpxpy
 import numpy as np
 import contextily as cx
+import requests
+import xyzservices
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import matplotlib
 from matplotlib.colors import Normalize
@@ -164,13 +168,13 @@ END_ROUTE_EXTRA_PADDING = 1.04
 # 地圖 / 路線
 ENABLE_BASEMAP = True
 TRACK_CMAP = "plasma"
-MAP_STYLE = cx.providers.CartoDB.DarkMatter
+MAP_STYLE = cx.providers.OpenStreetMap.Mapnik
 OVERVIEW_MAP_ZOOM = "auto"      # 結尾全程總覽圖；auto 即可
 LOCAL_MAP_ZOOM = 17             # 實測高畫質預設：Zoom 17
 LOCAL_CHUNK_STEP_M = 2200.0      # 相機移動多少公尺切換一個局部底圖 chunk
 LOCAL_CHUNK_BUFFER_M = 350.0     # chunk 額外邊界，避免裁切到黑邊
 LOCAL_CACHE_CHUNKS = 6           # RAM 中保留最近幾個 chunk；contextily 還有磁碟 tile cache
-MAP_CONNECTIONS = 4              # 每個 process 的 tile 連線數；4 workers 時約等於最多 16 條並行請求
+MAP_CONNECTIONS = 2              # 每個 process 的 tile 連線數；GUI 限制為 1~4
 MAP_USE_CACHE = True
 MAP_RESAMPLE = Image.Resampling.BILINEAR   # Pillow fallback
 USE_OPENCV_FAST_PATH = True       # 建議 pip install opencv-python；大幅加速鏡頭 crop/resize
@@ -207,10 +211,71 @@ AUTO_SECONDS_PER_100KM = 60.0
 AUTO_DURATION_MIN_SECONDS = 20.0
 
 MAP_STYLE_OPTIONS = {
-    "1": ("CartoDB.DarkMatter（深色，彩色軌跡對比最強）", cx.providers.CartoDB.DarkMatter),
-    "2": ("CartoDB.Voyager（全彩，接近 Relive / Google Maps 質感）", cx.providers.CartoDB.Voyager),
-    "3": ("CartoDB.Positron（淺灰白，極簡）", cx.providers.CartoDB.Positron),
-    "4": ("Esri.WorldImagery（衛星空拍）", cx.providers.Esri.WorldImagery),
+    "1": {
+        "name": "OpenStreetMap Mapnik",
+        "description": "標準道路地圖，街道與地名清楚",
+        "provider": cx.providers.OpenStreetMap.Mapnik,
+        "requires_api_key": False,
+        "api_key_env": None,
+        "api_key_placeholder": None,
+        "api_key_param": None,
+        "enabled_by_default": True,
+        "max_local_zoom": 16,
+        "allow_parallel_render": False,
+        "public_tile_server": True,
+    },
+    "2": {
+        "name": "CartoDB DarkMatter",
+        "description": "深色底圖，彩色軌跡對比最強",
+        "provider": cx.providers.CartoDB.DarkMatter,
+        "requires_api_key": True,
+        "api_key_env": "CARTODB_API_KEY",
+        "api_key_placeholder": "apikey",
+        "api_key_param": "key",
+        "enabled_by_default": False,
+        "max_local_zoom": None,
+        "allow_parallel_render": True,
+        "public_tile_server": False,
+    },
+    "3": {
+        "name": "CartoDB Voyager",
+        "description": "全彩道路地圖，接近 Relive / Google Maps 質感",
+        "provider": cx.providers.CartoDB.Voyager,
+        "requires_api_key": True,
+        "api_key_env": "CARTODB_API_KEY",
+        "api_key_placeholder": "apikey",
+        "api_key_param": "key",
+        "enabled_by_default": False,
+        "max_local_zoom": None,
+        "allow_parallel_render": True,
+        "public_tile_server": False,
+    },
+    "4": {
+        "name": "CartoDB Positron",
+        "description": "淺灰白底圖，簡潔明亮",
+        "provider": cx.providers.CartoDB.Positron,
+        "requires_api_key": True,
+        "api_key_env": "CARTODB_API_KEY",
+        "api_key_placeholder": "apikey",
+        "api_key_param": "key",
+        "enabled_by_default": False,
+        "max_local_zoom": None,
+        "allow_parallel_render": True,
+        "public_tile_server": False,
+    },
+    "5": {
+        "name": "Esri WorldImagery",
+        "description": "衛星空拍影像，適合呈現地形與環境",
+        "provider": cx.providers.Esri.WorldImagery,
+        "requires_api_key": True,
+        "api_key_env": "ESRI_API_KEY",
+        "api_key_placeholder": "token",
+        "api_key_param": "token",
+        "enabled_by_default": False,
+        "max_local_zoom": None,
+        "allow_parallel_render": True,
+        "public_tile_server": False,
+    },
 }
 
 # GUI / 子程序可動態覆寫的設定。Windows multiprocessing spawn 會重新 import 本檔，
@@ -256,6 +321,250 @@ def apply_render_config(config: dict | None):
 
 def snapshot_render_config() -> dict:
     return {key: globals()[key] for key in RUNTIME_CONFIG_KEYS}
+
+
+class MapProviderError(RuntimeError):
+    """可安全顯示給使用者的地圖 provider 錯誤（不得含 API key）。"""
+
+
+def _provider_requires_key(option: dict) -> bool:
+    """以 xyzservices metadata 為優先提示，並以本專案明確標記作保底。"""
+    provider = option["provider"]
+    for field in ("requires_api_key", "requires_token"):
+        value = getattr(provider, field, None)
+        try:
+            value = value() if callable(value) else value
+        except Exception:
+            value = None
+        if value is True:
+            return True
+    try:
+        if callable(getattr(provider, "requires_token", None)) and provider.requires_token():
+            return True
+    except Exception:
+        pass
+    return bool(option.get("requires_api_key", False))
+
+
+def _redact_secret(text: object, secret: str | None) -> str:
+    result = str(text)
+    if secret:
+        result = result.replace(secret, "***")
+    result = re.sub(r"(?i)(api[_-]?key|token|key)=([^&\s]+)", r"\1=***", result)
+    return result
+
+
+def resolve_map_provider(style_key: str, api_key: str | None = None):
+    """回傳獨立 runtime provider copy 與不含秘密的 metadata。"""
+    key = str(style_key)
+    if key not in MAP_STYLE_OPTIONS:
+        key = "1"
+    option = MAP_STYLE_OPTIONS[key]
+    requires_key = _provider_requires_key(option)
+    env_name = option.get("api_key_env")
+    supplied_key = (api_key or "").strip()
+    resolved_key = supplied_key or ((os.environ.get(env_name, "") if env_name else "").strip())
+    resolved_key = resolved_key or os.environ.get("GPX_MAP_API_KEY", "").strip()
+    if requires_key and not resolved_key:
+        raise MapProviderError(
+            f"{option['name']} 需要 API Key。請在地圖設定中輸入金鑰，"
+            "或改用免金鑰底圖。"
+        )
+
+    provider = copy.deepcopy(option["provider"])
+    provider["_gpx_public_tile_server"] = bool(option.get("public_tile_server", False))
+    if requires_key:
+        placeholder = option.get("api_key_placeholder") or "api_key"
+        param = option.get("api_key_param") or placeholder
+        url = str(provider.get("url", ""))
+        marker = "{" + placeholder + "}"
+        if marker not in url:
+            separator = "&" if "?" in url else "?"
+            provider["url"] = f"{url}{separator}{param}={marker}"
+        provider[placeholder] = resolved_key
+        try:
+            still_missing = bool(provider.requires_token())
+        except Exception:
+            still_missing = False
+        if still_missing:
+            raise MapProviderError(
+                f"{option['name']} 的 API Key 欄位與目前 xyzservices 版本不相容；"
+                "已停止渲染，避免產生錯誤浮水印影片。"
+            )
+
+    if supplied_key:
+        key_source = "gui"
+    elif env_name and os.environ.get(env_name, "").strip():
+        key_source = env_name
+    elif resolved_key:
+        key_source = "GPX_MAP_API_KEY"
+    else:
+        key_source = None
+    meta = {
+        "style_key": key,
+        "name": option["name"],
+        "requires_api_key": requires_key,
+        "api_key_source": key_source,
+        "max_local_zoom": option.get("max_local_zoom"),
+        "allow_parallel_render": bool(option.get("allow_parallel_render", True)),
+    }
+    return provider, meta
+
+
+def _placeholder_like_image(image: Image.Image) -> bool:
+    """辨識常見的純色/少量文字錯誤 placeholder，不做 OCR。"""
+    rgb = image.convert("RGB")
+    thumb = rgb.copy()
+    thumb.thumbnail((256, 256))
+    arr = np.asarray(thumb, dtype=np.uint8)
+    if arr.size == 0 or min(rgb.size) < 32:
+        return True
+    flat = arr.reshape(-1, 3)
+    grayscale = np.mean(np.max(flat, axis=1) - np.min(flat, axis=1) <= 3)
+    bright = np.mean(np.mean(flat, axis=1) >= 238)
+    dark = np.mean(np.mean(flat, axis=1) <= 80)
+    # 常見 API KEY REQUIRED / INVALID API KEY / ACCESS DENIED / TOKEN REQUIRED /
+    # UNAUTHORIZED / FORBIDDEN / RATE LIMIT placeholder 是單色背景加少量文字。
+    if grayscale > 0.985 and bright > 0.78 and 0.002 < dark < 0.18:
+        return True
+    if grayscale > 0.985 and dark > 0.78 and 0.002 < bright < 0.18:
+        return True
+    if grayscale > 0.985:
+        gray = np.mean(flat, axis=1)
+        bins = np.clip((gray // 16).astype(np.int32), 0, 15)
+        counts = np.bincount(bins, minlength=16)
+        dominant_bin = int(np.argmax(counts))
+        dominant = (dominant_bin + 0.5) * 16.0
+        contrast = np.mean(np.abs(gray - dominant) >= 48.0)
+        if counts[dominant_bin] / max(len(gray), 1) > 0.78 and 0.002 < contrast < 0.18:
+            return True
+    return False
+
+
+def is_error_tile(image: Image.Image) -> bool:
+    """以便宜的影像統計與重複 tile 特徵攔截 HTTP 200 錯誤圖。"""
+    rgb = image.convert("RGB")
+    w, h = rgb.size
+    # 只對單一 validation tile 使用文字 placeholder 統計。大型 raster 經縮圖後，
+    # 正常的淺色街圖也可能呈現「單色背景 + 少量深色線條」，不可直接套用。
+    if w <= 512 and h <= 512:
+        return _placeholder_like_image(rgb)
+    if w >= 512 and h >= 256:
+        tiles = []
+        for y in range(0, h - 255, 256):
+            for x in range(0, w - 255, 256):
+                tiles.append(np.asarray(rgb.crop((x, y, x + 256, y + 256))))
+                if len(tiles) >= 6:
+                    break
+            if len(tiles) >= 6:
+                break
+        if len(tiles) >= 4:
+            identical_to_first = sum(np.array_equal(tiles[0], tile) for tile in tiles[1:])
+            # 至少四張完全相同且具有錯誤 placeholder 特徵才判定；避免正常地圖中
+            # 兩張空白海域或邊界 tile 偶然相同造成誤判。
+            if identical_to_first >= 3:
+                return _placeholder_like_image(Image.fromarray(tiles[0]))
+    return False
+
+
+detect_provider_error_image = is_error_tile
+
+
+def _mercator_to_tile(x: float, y: float, zoom: int) -> tuple[int, int]:
+    r = 6378137.0
+    lon = math.degrees(x / r)
+    lat = math.degrees(2.0 * math.atan(math.exp(y / r)) - math.pi / 2.0)
+    n = 2 ** zoom
+    tx = int((lon + 180.0) / 360.0 * n)
+    lat_rad = math.radians(max(-85.05112878, min(85.05112878, lat)))
+    ty = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
+    return max(0, min(n - 1, tx)), max(0, min(n - 1, ty))
+
+
+def validate_map_provider(
+    style_key: str,
+    api_key: str | None = None,
+    center_x: float | None = None,
+    center_y: float | None = None,
+):
+    """用單一實際 tile 驗證授權、HTTP 狀態與錯誤 placeholder。"""
+    provider, meta = resolve_map_provider(style_key, api_key)
+    # 沒有 GPX 時以台北市中心作為安全的小型連線測試位置。
+    if center_x is None or center_y is None:
+        test_x, test_y = latlon_to_mercator(np.array([25.0330]), np.array([121.5654]))
+        center_x, center_y = float(test_x[0]), float(test_y[0])
+    zoom = 12
+    tile_x, tile_y = _mercator_to_tile(float(center_x), float(center_y), zoom)
+    try:
+        url = provider.build_url(x=tile_x, y=tile_y, z=zoom)
+    except Exception as exc:
+        raise MapProviderError(f"{meta['name']} URL 設定無效：{_redact_secret(exc, api_key)}") from None
+
+    headers = {"User-Agent": "GPX-Ride-Renderer/1.0 (map provider validation)"}
+    response = None
+    for attempt in range(4):
+        try:
+            response = requests.get(url, headers=headers, timeout=(5, 15))
+        except requests.RequestException as exc:
+            if attempt < 3:
+                time.sleep(2 ** attempt)
+                continue
+            raise MapProviderError(
+                f"{meta['name']} 連線失敗：{_redact_secret(exc, api_key)}。請稍後重試。"
+            ) from None
+        if response.status_code != 429:
+            break
+        if attempt < 3:
+            time.sleep(2 ** attempt)
+
+    assert response is not None
+    if response.status_code in (401, 403):
+        raise MapProviderError(f"{meta['name']} 拒絕授權；請確認 API Key / Token 是否正確。")
+    if response.status_code == 429:
+        raise MapProviderError(f"{meta['name']} 請求過於頻繁（HTTP 429）；請降低 tile connections 或稍後重試。")
+    if not response.ok:
+        raise MapProviderError(f"{meta['name']} 地圖伺服器回傳 HTTP {response.status_code}；請稍後重試。")
+    try:
+        image = Image.open(BytesIO(response.content))
+        image.load()
+        image = image.convert("RGB")
+    except Exception:
+        raise MapProviderError(f"{meta['name']} 回傳的內容不是有效地圖圖片。") from None
+    if meta["name"].startswith("CartoDB"):
+        # CARTO 錯誤 tile 會在正常地圖上疊加斜向 API KEY REQUIRED / INVALID
+        # API KEY 浮水印。以同座標、固定無效 key 取得 provider 自己的錯誤
+        # 簽章並比較像素；只在開始渲染前做一次，不需 OCR，也不會逐幀執行。
+        invalid_url = re.sub(
+            r"([?&]key=)[^&]+", r"\1__invalid_gpx_renderer_key__", url,
+            flags=re.IGNORECASE,
+        )
+        if invalid_url != url:
+            try:
+                invalid_response = requests.get(invalid_url, headers=headers, timeout=(5, 15))
+                if invalid_response.ok:
+                    invalid_image = Image.open(BytesIO(invalid_response.content)).convert("RGB")
+                    invalid_image.load()
+                    if invalid_image.size == image.size:
+                        actual = np.asarray(image, dtype=np.int16)
+                        signature = np.asarray(invalid_image, dtype=np.int16)
+                        identical_pixels = float(np.mean(np.all(actual == signature, axis=2)))
+                        mean_difference = float(np.mean(np.abs(actual - signature)))
+                        if identical_pixels >= 0.995 or mean_difference <= 0.20:
+                            raise MapProviderError(
+                                f"{meta['name']} 拒絕目前的 API Key，並回傳 API KEY REQUIRED / "
+                                "INVALID API KEY 浮水印；請確認金鑰後再試。"
+                            )
+            except MapProviderError:
+                raise
+            except Exception:
+                # 簽章請求是第二層偵測；若它失敗，仍執行下方通用檢查。
+                pass
+    if not meta["name"].startswith("CartoDB") and is_error_tile(image):
+        raise MapProviderError(
+            f"{meta['name']} 回傳 API KEY REQUIRED / ACCESS DENIED 類型的錯誤圖片；"
+            "請確認金鑰、改用免金鑰底圖，或稍後重試。"
+        )
+    return provider, meta
 
 # 顏色
 ORANGE = (255, 87, 34)
@@ -317,16 +626,18 @@ class RasterMap:
 # ===========================================================
 def choose_map_style():
     print("\n請選擇地圖底圖風格：")
-    for key, (label, _) in MAP_STYLE_OPTIONS.items():
-        print(f"  {key}. {label}")
+    for key, option in MAP_STYLE_OPTIONS.items():
+        suffix = " [需要 API Key]" if _provider_requires_key(option) else ""
+        print(f"  {key}. {option['name']}（{option['description']}）{suffix}")
 
     choice = input("輸入編號 (直接 Enter 預設 1): ").strip() or "1"
     if choice not in MAP_STYLE_OPTIONS:
         print(f"輸入無效「{choice}」，改用預設 1。")
         choice = "1"
 
-    label, provider = MAP_STYLE_OPTIONS[choice]
-    print(f"已選擇：{label}\n")
+    option = MAP_STYLE_OPTIONS[choice]
+    provider, _ = resolve_map_provider(choice)
+    print(f"已選擇：{option['name']}\n")
     return choice, provider
 
 
@@ -527,30 +838,63 @@ def load_font(size: int, bold: bool = False):
 # ===========================================================
 def _fetch_raster(west: float, south: float, east: float, north: float, map_style, zoom, use_cache: bool | None = None) -> RasterMap:
     """下載指定 EPSG:3857 bbox 的 raster。contextily 會自行快取底層 tiles。"""
+    provider_name = str(map_style.get("name", "目前選擇的地圖 provider"))
     if use_cache is None:
         use_cache = MAP_USE_CACHE
-    if getattr(sys, "frozen", False) and use_cache and MAP_CONNECTIONS > 1:
+    effective_connections = min(max(1, int(MAP_CONNECTIONS)), 2 if int(RENDER_WORKERS) > 1 else 4)
+    if bool(map_style.get("_gpx_public_tile_server", False)):
+        # 公共 OSM server 使用單連線並保留 contextily cache，避免多連線 joblib
+        # 與大量重複請求；這也讓 frozen EXE 不會啟動額外 tile helper process。
+        effective_connections = 1
+    if getattr(sys, "frozen", False) and use_cache and effective_connections > 1:
         # contextily uses joblib processes when cache and multiple connections
         # are both enabled. In a frozen app those helper processes restart this
         # EXE and collide with PyInstaller's multiprocessing runtime hook.
         # Disabling the joblib disk cache makes contextily use threads instead.
         print("[INFO] Frozen EXE 底圖下載：使用 threads，停用 contextily/joblib process cache。")
         use_cache = False
-    img_np, extent = cx.bounds2img(
-        west,
-        south,
-        east,
-        north,
-        zoom=zoom,
-        source=map_style,
-        ll=False,
-        wait=0,
-        max_retries=2,
-        n_connections=MAP_CONNECTIONS,
-        use_cache=use_cache,
-    )
+    print(f"[INFO] Map tile connections per worker: {effective_connections}")
+    last_error = None
+    for attempt in range(4):
+        try:
+            img_np, extent = cx.bounds2img(
+                west,
+                south,
+                east,
+                north,
+                zoom=zoom,
+                source=map_style,
+                ll=False,
+                wait=1,
+                max_retries=0,
+                n_connections=effective_connections,
+                use_cache=use_cache,
+            )
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt < 3:
+                time.sleep(2 ** attempt)
+    else:
+        provider_secret = str(
+            map_style.get("apikey", "")
+            or map_style.get("api_key", "")
+            or map_style.get("token", "")
+        )
+        reason = _redact_secret(last_error, provider_secret)
+        raise MapProviderError(
+            f"{provider_name} 地圖下載失敗：{reason}。請確認 API Key、改用免金鑰底圖、"
+            "降低 tile connections，或稍後重試。"
+        ) from None
     left, right, bottom, top = map(float, extent)
     image = Image.fromarray(np.asarray(img_np)).convert("RGB")
+    # CARTO 使用 render 前的專用無效-key 浮水印簽章驗證。不要在大型 local
+    # raster 上再套用通用淺色統計，否則正常 Voyager/Positron 區塊會被誤判。
+    if not provider_name.startswith("CartoDB") and detect_provider_error_image(image):
+        raise MapProviderError(
+            f"{provider_name} 回傳 API KEY REQUIRED / ACCESS DENIED 類型的錯誤圖片。"
+            "請確認 API Key 或改用免金鑰底圖。"
+        )
     return RasterMap(image, left, right, bottom, top)
 
 
@@ -600,14 +944,9 @@ def build_overview_raster_map(data: RideData, map_style) -> RasterMap:
         return RasterMap(image, west, east, south, north)
 
     print("[MAP] 下載 / 組裝全程 overview 底圖（只做一次，供結尾 zoom-out）...")
-    try:
-        rm = _fetch_raster(west, south, east, north, map_style, OVERVIEW_MAP_ZOOM)
-        print(f"[OK] Overview raster：{rm.width}x{rm.height} px")
-        return rm
-    except Exception as exc:
-        print(f"[WARN] Overview 底圖下載失敗，改純色背景：{exc}")
-        image = Image.new("RGB", (2048, 2048), (17, 17, 17))
-        return RasterMap(image, west, east, south, north)
+    rm = _fetch_raster(west, south, east, north, map_style, OVERVIEW_MAP_ZOOM)
+    print(f"[OK] Overview raster：{rm.width}x{rm.height} px")
+    return rm
 
 
 @dataclass
@@ -675,12 +1014,10 @@ class LocalBasemapCache:
             image = Image.new("RGB", (1024, 1024), (17, 17, 17))
             return LocalChunkState(RasterMap(image, west, east, south, north))
 
-        try:
-            rm = _fetch_raster(west, south, east, north, self.map_style, LOCAL_MAP_ZOOM, use_cache=self.tile_cache_enabled)
-        except Exception as exc:
-            print(f"\n[WARN] 局部底圖 chunk {key} 下載失敗，使用純色背景：{exc}")
-            image = Image.new("RGB", (1024, 1024), (17, 17, 17))
-            rm = RasterMap(image, west, east, south, north)
+        rm = _fetch_raster(
+            west, south, east, north, self.map_style, LOCAL_MAP_ZOOM,
+            use_cache=self.tile_cache_enabled,
+        )
         return LocalChunkState(rm)
 
     @staticmethod
@@ -1595,6 +1932,7 @@ class SegmentTask:
 class DynamicWorkerConfig:
     gpx_path: str
     map_style_key: str
+    api_key: str
     fps: int
     video_duration: float
     ffmpeg: str
@@ -1658,7 +1996,7 @@ def _benchmark_worker_entry(
                 pass
 
         data = load_gpx(worker_cfg.gpx_path)
-        map_style = MAP_STYLE_OPTIONS[worker_cfg.map_style_key][1]
+        map_style = copy.deepcopy(MAP_STYLE_OPTIONS[worker_cfg.map_style_key]["provider"])
         renderer = RideRenderer(
             data=data, overview_map=None, map_style=map_style, fps=worker_cfg.fps,
             video_duration=worker_cfg.video_duration, zoom_out_duration=0.0, end_hold_duration=0.0,
@@ -1971,6 +2309,10 @@ def _encode_chunk_with_renderer(renderer: RideRenderer, task: SegmentTask, ffmpe
     last_progress_t = start_t
     total = task.end_frame - task.start_frame
     result_queue.put(("start", worker_id, task.segment_index, 0, total, ""))
+    if ENABLE_BASEMAP:
+        # 第一個 render_main_frame 會同步下載/組裝 local raster；在它完成前尚無
+        # 任何影片 frame，因此用獨立狀態告訴 GUI 目前正在做什麼。
+        result_queue.put(("map", worker_id, task.segment_index, 0, total, ""))
     try:
         for frame_idx in range(task.start_frame, task.end_frame):
             frame = renderer.render_main_frame(frame_idx)
@@ -2009,7 +2351,7 @@ def _dynamic_worker_loop(worker_id: int, worker_cfg: DynamicWorkerConfig, task_q
             except Exception:
                 pass
         data = load_gpx(worker_cfg.gpx_path)
-        map_style = MAP_STYLE_OPTIONS[worker_cfg.map_style_key][1]
+        map_style, _ = resolve_map_provider(worker_cfg.map_style_key, worker_cfg.api_key)
         renderer = RideRenderer(
             data=data, overview_map=None, map_style=map_style, fps=worker_cfg.fps,
             video_duration=worker_cfg.video_duration, zoom_out_duration=0.0, end_hold_duration=0.0,
@@ -2022,10 +2364,15 @@ def _dynamic_worker_loop(worker_id: int, worker_cfg: DynamicWorkerConfig, task_q
                 break
             try:
                 _encode_chunk_with_renderer(renderer, task, worker_cfg.ffmpeg, worker_cfg.encoder, worker_id, result_queue)
+            except MapProviderError as exc:
+                result_queue.put(("map_error", worker_id, task.segment_index, 0, 0, str(exc)))
+                return
             except Exception as exc:
                 result_queue.put(("error", worker_id, task.segment_index, 0, 0, repr(exc)))
                 return
         result_queue.put(("exit", worker_id, -1, 0, 0, ""))
+    except MapProviderError as exc:
+        result_queue.put(("map_error", worker_id, -1, 0, 0, str(exc)))
     except Exception as exc:
         result_queue.put(("error", worker_id, -1, 0, 0, repr(exc)))
 
@@ -2101,6 +2448,7 @@ def encode_video_parallel(
     gpx_path: str,
     map_style_key: str,
     map_style,
+    api_key: str,
     fps: int,
     duration: float,
     ffmpeg: str,
@@ -2124,7 +2472,8 @@ def encode_video_parallel(
         for i, (a, b) in enumerate(ranges)
     ]
     worker_cfg = DynamicWorkerConfig(
-        gpx_path=gpx_path, map_style_key=map_style_key, fps=fps, video_duration=duration,
+        gpx_path=gpx_path, map_style_key=map_style_key, api_key=api_key,
+        fps=fps, video_duration=duration,
         ffmpeg=ffmpeg, encoder=encoder, settings=snapshot_render_config(),
     )
 
@@ -2165,6 +2514,8 @@ def encode_video_parallel(
                 worker_status[worker_id] = "待命"
             elif kind == "start":
                 worker_status[worker_id] = f"C{chunk_idx + 1}/{len(tasks)} 0%"
+            elif kind == "map":
+                worker_status[worker_id] = f"C{chunk_idx + 1}/{len(tasks)} 下載底圖"
             elif kind == "progress":
                 chunk_progress[chunk_idx] = max(chunk_progress.get(chunk_idx, 0), int(done_local))
                 worker_status[worker_id] = f"C{chunk_idx + 1}/{len(tasks)} {100.0 * done_local / max(total,1):.0f}%"
@@ -2178,6 +2529,8 @@ def encode_video_parallel(
                 print(f"\n[OK] Chunk {chunk_idx + 1}/{len(tasks)} 完成：{total} frames | {fps_done:.1f} frame/s | Worker {worker_id + 1}")
             elif kind == "exit":
                 worker_status[worker_id] = "完成"
+            elif kind == "map_error":
+                raise MapProviderError(payload)
             elif kind == "error":
                 raise RuntimeError(f"Worker {worker_id + 1} / chunk {chunk_idx + 1 if chunk_idx >= 0 else '?'} 失敗：\n{payload}")
 
@@ -2246,7 +2599,7 @@ def encode_video_parallel(
 
 def render_job(config: dict | None = None):
     """實際渲染入口。可由 CLI 或 Tkinter 啟動的子程序呼叫。"""
-    global gpx_filename, output_filename
+    global gpx_filename, output_filename, LOCAL_MAP_ZOOM
     config = dict(config or {})
     apply_render_config(config)
 
@@ -2258,8 +2611,13 @@ def render_job(config: dict | None = None):
     map_style_key = str(config.get("map_style_key", "1"))
     if map_style_key not in MAP_STYLE_OPTIONS:
         map_style_key = "1"
-    map_label, map_style = MAP_STYLE_OPTIONS[map_style_key]
-    print(f"[INFO] 地圖風格：{map_label}")
+    api_key = str(config.get("map_api_key", "") or "")
+    if ENABLE_BASEMAP:
+        map_style, map_meta = resolve_map_provider(map_style_key, api_key)
+    else:
+        map_meta = MAP_STYLE_OPTIONS[map_style_key]
+        map_style = copy.deepcopy(map_meta["provider"])
+    print(f"[INFO] 地圖風格：{map_meta['name']}")
 
     fps = PREVIEW_FPS if PREVIEW_MODE else FPS
     duration = min(VIDEO_DURATION, PREVIEW_DURATION) if PREVIEW_MODE else VIDEO_DURATION
@@ -2284,6 +2642,29 @@ def render_job(config: dict | None = None):
             f"→ {VIDEO_DURATION:.1f}s ({format_seconds_human(VIDEO_DURATION)})"
         )
 
+    if ENABLE_BASEMAP:
+        print("[MAP] 正式渲染前驗證地圖 provider...")
+        map_style, map_meta = validate_map_provider(
+            map_style_key, api_key, data.route_center_x, data.route_center_y,
+        )
+        print(f"[OK] 地圖連線成功：{map_meta['name']}")
+        max_local_zoom = map_meta.get("max_local_zoom")
+        if max_local_zoom is not None and isinstance(LOCAL_MAP_ZOOM, int) and LOCAL_MAP_ZOOM > int(max_local_zoom):
+            print(
+                f"[INFO] {map_meta['name']} 為公共 tile server：Local Zoom "
+                f"{LOCAL_MAP_ZOOM} 自動限制為 {max_local_zoom}，避免大量下載與限流。"
+            )
+            LOCAL_MAP_ZOOM = int(max_local_zoom)
+        if (
+            PARALLEL_RENDER and int(RENDER_WORKERS) > 1
+            and isinstance(LOCAL_MAP_ZOOM, int) and LOCAL_MAP_ZOOM > 16
+        ):
+            print(
+                f"[INFO] 多 worker 底圖模式：Local Zoom {LOCAL_MAP_ZOOM} 自動限制為 16，"
+                "將首批 tile 數量降至約四分之一。"
+            )
+            LOCAL_MAP_ZOOM = 16
+
     ffmpeg = find_ffmpeg()
     print(f"[INFO] FFmpeg：{ffmpeg}")
     encoder = choose_encoder(ffmpeg, fps)
@@ -2302,6 +2683,7 @@ def render_job(config: dict | None = None):
         PARALLEL_RENDER
         and RENDER_WORKERS > 1
         and encoder == "h264_nvenc"
+        and (not ENABLE_BASEMAP or map_meta.get("allow_parallel_render", True))
     )
 
     parallel_ok = False
@@ -2316,6 +2698,7 @@ def render_job(config: dict | None = None):
                 gpx_path=gpx_path,
                 map_style_key=map_style_key,
                 map_style=map_style,
+                api_key=api_key,
                 fps=fps,
                 duration=duration,
                 ffmpeg=ffmpeg,
@@ -2323,6 +2706,8 @@ def render_job(config: dict | None = None):
                 output=output_path,
             )
             parallel_ok = True
+        except MapProviderError:
+            raise
         except Exception as exc:
             print(f"[WARN] Parallel render 失敗，將自動回退單 process：{exc}")
 
@@ -2334,6 +2719,8 @@ def render_job(config: dict | None = None):
             reasons.append(f"Workers={RENDER_WORKERS}")
         if encoder != "h264_nvenc":
             reasons.append(f"encoder={encoder}")
+        if ENABLE_BASEMAP and not map_meta.get("allow_parallel_render", True):
+            reasons.append(f"{map_meta['name']} 公共圖磚採單一 renderer，避免重複下載與限流")
         if reasons:
             print("[INFO] 單 process 原因：" + "；".join(reasons))
         if HAVE_CV2:
@@ -2404,13 +2791,15 @@ def launch_gui():
     state = {
         "proc": None, "proc_mode": None, "config_path": None,
         "gpx_distance_km": None, "gpx_distance_path": None,
-        "benchmark_result": None,
+        "benchmark_result": None, "map_error": None,
     }
 
     # ---------- variables ----------
     gpx_var = tk.StringVar(value=str(Path(gpx_filename).resolve()))
     out_var = tk.StringVar(value=str(Path(output_filename).resolve()))
     map_var = tk.StringVar(value="1")
+    map_api_key_var = tk.StringVar(value="")
+    map_api_hint_var = tk.StringVar(value="此圖源不需要 API Key")
     profile_var = tk.StringVar(value="高畫質")
     width_var = tk.IntVar(value=FRAME_WIDTH)
     height_var = tk.IntVar(value=FRAME_HEIGHT)
@@ -2738,7 +3127,11 @@ def launch_gui():
     for c in range(6):
         settings.columnconfigure(c, weight=1 if c in (1, 3, 5) else 0)
 
-    map_labels = [f"{k}. {v[0]}" for k, v in MAP_STYLE_OPTIONS.items()]
+    map_labels = [
+        f"{k}. {v['name']}（{v['description']}）"
+        f"{' [API Key]' if _provider_requires_key(v) else ''}"
+        for k, v in MAP_STYLE_OPTIONS.items()
+    ]
     map_combo_var = tk.StringVar(value=map_labels[0])
     ttk.Label(settings, text="地圖風格").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=4)
     map_field = ttk.Frame(settings)
@@ -2747,9 +3140,30 @@ def launch_gui():
     map_combo = ttk.Combobox(map_field, textvariable=map_combo_var, values=map_labels, state="readonly", width=28)
     map_combo.grid(row=0, column=0, sticky="ew")
     help_button(map_field, "map_style").grid(row=0, column=1, padx=(5, 0))
+    api_row = ttk.Frame(map_field)
+    api_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+    api_row.columnconfigure(1, weight=1)
+    ttk.Label(api_row, text="API Key / Token").grid(row=0, column=0, sticky="w", padx=(0, 6))
+    api_entry = ttk.Entry(api_row, textvariable=map_api_key_var, show="•")
+    api_entry.grid(row=0, column=1, sticky="ew")
+    map_test_btn = ttk.Button(api_row, text="測試地圖連線", command=lambda: start_map_test())
+    map_test_btn.grid(row=0, column=2, padx=(6, 0))
+    api_hint = ttk.Label(api_row, textvariable=map_api_hint_var)
+    api_hint.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
     def on_map_change(_=None):
         map_var.set(map_combo_var.get().split(".", 1)[0])
+        needs_key = _provider_requires_key(MAP_STYLE_OPTIONS[map_var.get()])
+        api_entry.configure(state="normal" if needs_key else "disabled")
+        map_api_hint_var.set(
+            "可由此欄輸入，或使用 provider 專用環境變數 / GPX_MAP_API_KEY"
+            if needs_key else (
+                "此圖源不需要 API Key；公共圖磚自動使用單一 renderer，Local Zoom 最高 16"
+                if MAP_STYLE_OPTIONS[map_var.get()].get("public_tile_server")
+                else "此圖源不需要 API Key"
+            )
+        )
     map_combo.bind("<<ComboboxSelected>>", on_map_change)
+    on_map_change()
 
     ttk.Label(settings, text="模式").grid(row=0, column=4, sticky="e", padx=(12, 6))
     profile_field = ttk.Frame(settings)
@@ -2833,7 +3247,7 @@ def launch_gui():
     ttk.Label(settings, text="Tile connections").grid(row=4, column=4, sticky="e", padx=(12, 6))
     connections_field = ttk.Frame(settings)
     connections_field.grid(row=4, column=5, sticky="w")
-    ttk.Spinbox(connections_field, from_=1, to=16, textvariable=connections_var, width=8).pack(side="left")
+    ttk.Spinbox(connections_field, from_=1, to=4, textvariable=connections_var, width=8).pack(side="left")
     help_button(connections_field, "tile_connections").pack(side="left", padx=(5, 0))
 
     ttk.Label(settings, text="Zoom-out 秒").grid(row=5, column=0, sticky="w", pady=4)
@@ -2941,12 +3355,15 @@ def launch_gui():
         elif line.startswith("[DONE] 完成："):
             progress_var.set(100.0); status_var.set("完成")
 
-    def collect_config():
+    def collect_config(validate_provider_key: bool = True):
         try:
             w = int(width_var.get()); h = int(height_var.get()); fps = int(fps_var.get())
             workers = int(workers_var.get()); chunks = int(chunks_var.get())
-            if w < 320 or h < 320 or fps <= 0 or workers <= 0 or chunks <= 0:
+            connections = int(connections_var.get())
+            if w < 320 or h < 320 or fps <= 0 or workers <= 0 or chunks <= 0 or not 1 <= connections <= 4:
                 raise ValueError
+            if validate_provider_key and bool(basemap_var.get()):
+                resolve_map_provider(map_var.get(), map_api_key_var.get())
 
             auto_enabled = bool(auto_duration_var.get())
             if auto_enabled:
@@ -2971,12 +3388,18 @@ def launch_gui():
                 dur = float(duration_var.get())
             if dur <= 0:
                 raise ValueError
+        except MapProviderError:
+            raise
         except Exception as exc:
             raise ValueError(f"解析度、FPS、動畫秒數、Workers、Chunks/Worker 與自動時長設定必須有效。\n{exc}")
         return {
             "gpx_filename": str(Path(gpx_var.get().strip()).expanduser().resolve()),
             "output_filename": str(Path(out_var.get().strip()).expanduser().resolve()),
             "map_style_key": map_var.get(),
+            "map_api_key": (
+                map_api_key_var.get().strip()
+                if _provider_requires_key(MAP_STYLE_OPTIONS[map_var.get()]) else ""
+            ),
             "FRAME_WIDTH": w,
             "FRAME_HEIGHT": h,
             "FPS": fps,
@@ -2990,7 +3413,7 @@ def launch_gui():
             "LOCAL_MAP_ZOOM": _normalize_zoom(local_zoom_var.get()),
             "RENDER_WORKERS": workers,
             "CHUNKS_PER_WORKER": chunks,
-            "MAP_CONNECTIONS": int(connections_var.get()),
+            "MAP_CONNECTIONS": connections,
             "NVENC_BITRATE": bitrate_var.get().strip(),
             "NVENC_PRESET": preset_var.get().strip(),
             "PARALLEL_RENDER": bool(parallel_var.get()),
@@ -3003,6 +3426,7 @@ def launch_gui():
     def set_running(running: bool):
         start_btn.configure(state="disabled" if running else "normal")
         benchmark_btn.configure(state="disabled" if running else "normal")
+        map_test_btn.configure(state="disabled" if running else "normal")
         stop_btn.configure(state="normal" if running else "disabled")
         if running:
             apply_benchmark_btn.configure(state="disabled")
@@ -3065,6 +3489,8 @@ def launch_gui():
             else:
                 status_var.set(f"失敗 (exit {returncode})")
                 append_log(f"[ERROR] GUI：渲染程序結束碼 {returncode}")
+                if state.get("map_error"):
+                    messagebox.showerror("地圖下載失敗", state.pop("map_error"))
 
     def reader_thread(proc):
         buf = ""
@@ -3077,6 +3503,8 @@ def launch_gui():
                         root.after(0, append_log, buf)
                         root.after(0, parse_progress, buf)
                         root.after(0, _consume_benchmark_result, buf)
+                        if buf.startswith("[MAP ERROR]"):
+                            state["map_error"] = buf.partition("]")[2].strip()
                     break
                 if ch in "\r\n":
                     if buf.strip():
@@ -3084,6 +3512,8 @@ def launch_gui():
                         root.after(0, append_log, line)
                         root.after(0, parse_progress, line)
                         root.after(0, _consume_benchmark_result, line)
+                        if line.startswith("[MAP ERROR]"):
+                            state["map_error"] = line.partition("]")[2].strip()
                     buf = ""
                 else:
                     buf += ch
@@ -3133,7 +3563,7 @@ def launch_gui():
         if state["proc"] is not None:
             return
         try:
-            cfg = collect_config()
+            cfg = collect_config(validate_provider_key=False)
         except Exception as exc:
             messagebox.showerror("設定錯誤", str(exc)); return
         if not Path(cfg["gpx_filename"]).is_file():
@@ -3160,11 +3590,39 @@ def launch_gui():
             set_running(False)
             messagebox.showerror("效能測試啟動失敗", str(exc))
 
+    def start_map_test():
+        if state["proc"] is not None:
+            return
+        style_key = map_var.get()
+        secret = map_api_key_var.get()
+        try:
+            resolve_map_provider(style_key, secret)
+        except MapProviderError as exc:
+            messagebox.showerror("地圖下載失敗", str(exc))
+            return
+        map_test_btn.configure(state="disabled")
+        status_var.set("測試地圖連線中")
+
+        def worker():
+            try:
+                _, meta = validate_map_provider(style_key, secret)
+                root.after(0, lambda: messagebox.showinfo("地圖連線成功", f"{meta['name']} 可正常下載地圖。"))
+                root.after(0, status_var.set, "地圖連線成功")
+            except MapProviderError as exc:
+                root.after(0, lambda msg=str(exc): messagebox.showerror("地圖下載失敗", msg))
+                root.after(0, status_var.set, "地圖連線失敗")
+            finally:
+                root.after(0, map_test_btn.configure, {"state": "normal"})
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def start_render():
         if state["proc"] is not None:
             return
         try:
             cfg = collect_config()
+        except MapProviderError as exc:
+            messagebox.showerror("地圖下載失敗", str(exc)); return
         except Exception as exc:
             messagebox.showerror("設定錯誤", str(exc)); return
         if not Path(cfg["gpx_filename"]).is_file():
@@ -3225,11 +3683,52 @@ def launch_gui():
     root.mainloop()
 
 
+def self_test() -> int:
+    """不需 GPX 的 release/startup 檢查；預設 provider 會做一次真實 tile 測試。"""
+    print("[SELF TEST]")
+    print(f"Python: {sys.version.split()[0]} | frozen={bool(getattr(sys, 'frozen', False))}")
+    failures = []
+    try:
+        ffmpeg = find_ffmpeg()
+        version_result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-version"], capture_output=True, text=True,
+            errors="replace", check=False, **_background_subprocess_kwargs(),
+        )
+        version_line = (version_result.stdout or version_result.stderr).splitlines()[0]
+        print(f"FFmpeg: OK | {ffmpeg}")
+        print(f"FFmpeg version: {version_line}")
+        x264 = encoder_is_listed(ffmpeg, "libx264")
+        nvenc = encoder_is_listed(ffmpeg, "h264_nvenc")
+        print(f"libx264: {'OK' if x264 else 'MISSING'}")
+        print(f"NVENC: {'OK' if nvenc else 'not available (optional)'}")
+        if not x264:
+            failures.append("libx264")
+    except Exception as exc:
+        print(f"FFmpeg: FAIL | {exc}")
+        failures.append("FFmpeg")
+    print(f"contextily: {getattr(cx, '__version__', 'unknown')}")
+    print(f"xyzservices: {getattr(xyzservices, '__version__', 'unknown')}")
+    print(f"OpenCV: {'OK' if HAVE_CV2 else 'MISSING'}")
+    default_meta = MAP_STYLE_OPTIONS["1"]
+    print(f"Map provider: {default_meta['name']}")
+    print(f"Map provider requires key: {_provider_requires_key(default_meta)}")
+    try:
+        validate_map_provider("1")
+        print("Map provider test: OK")
+    except MapProviderError as exc:
+        print(f"Map provider test: FAIL | {exc}")
+        failures.append("map provider")
+    return 1 if failures else 0
+
+
 def main():
     # PyInstaller spec 使用 noconsole bootloader。保留 WinAPI hide，讓舊版 build
     # 或直接以 console bootloader 執行時也不會留下主視窗終端。
     if len(sys.argv) == 1:
         _hide_frozen_console_for_gui()
+
+    if len(sys.argv) >= 2 and sys.argv[1] == "--self-test":
+        raise SystemExit(self_test())
 
     # 預設直接開 GUI；--render-config 只給 GUI 啟動的 render subprocess 使用。
     if len(sys.argv) >= 3 and sys.argv[1] == "--render-config":
@@ -3251,6 +3750,9 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\n[INFO] 已取消。")
+    except MapProviderError as exc:
+        print(f"[MAP ERROR] {exc}")
+        raise SystemExit(2)
     except Exception as exc:
         print(f"\n[ERROR] {type(exc).__name__}: {exc}")
         raise

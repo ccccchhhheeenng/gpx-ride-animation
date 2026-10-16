@@ -51,6 +51,8 @@ echo [2/6] Installing build dependencies...
 if errorlevel 1 goto :fail
 "%VPIP%" install -r requirements-build.txt
 if errorlevel 1 goto :fail
+"%VPY%" -c "import contextily,xyzservices; print('[INFO] contextily:', contextily.__version__); print('[INFO] xyzservices:', xyzservices.__version__)"
+if errorlevel 1 goto :fail
 
 echo.
 echo [3/6] Locating FFmpeg...
@@ -82,6 +84,8 @@ copy /Y "%FFMPEG_SRC%" "_build_assets\ffmpeg.exe" >nul
 if errorlevel 1 goto :fail
 
 echo [INFO] FFmpeg: %FFMPEG_SRC%
+"_build_assets\ffmpeg.exe" -hide_banner -version
+if errorlevel 1 goto :fail
 "_build_assets\ffmpeg.exe" -hide_banner -encoders 2>nul | findstr /i "h264_nvenc" >nul
 if errorlevel 1 (
     echo [WARN] h264_nvenc was not found in this FFmpeg build.
@@ -92,7 +96,9 @@ if errorlevel 1 (
 
 "_build_assets\ffmpeg.exe" -hide_banner -encoders 2>nul | findstr /i "libx264" >nul
 if errorlevel 1 (
-    echo [WARN] libx264 was not found in this FFmpeg build.
+    echo [ERROR] libx264 was not found in this FFmpeg build.
+    echo [ERROR] A release must include the CPU encoding fallback.
+    goto :fail
 ) else (
     echo [OK] libx264 encoder found.
 )
@@ -115,6 +121,13 @@ echo.
 echo [5/6] Adding portable FFmpeg...
 copy /Y "_build_assets\ffmpeg.exe" "dist\GPX Ride Renderer\ffmpeg.exe" >nul
 if errorlevel 1 goto :fail
+
+echo [INFO] Running release self-test...
+"dist\GPX Ride Renderer\GPX Ride Renderer.exe" --self-test
+if errorlevel 1 (
+    echo [ERROR] Release self-test failed.
+    goto :fail
+)
 
 echo.
 echo [6/6] Creating release ZIP...
